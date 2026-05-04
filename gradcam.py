@@ -61,7 +61,7 @@ class GradCAM:
 
 def get_target_layer(model, arch):
     arch = arch.lower()
-    if arch == "resnet50":
+    if arch in {"resnet18", "resnet50"}:
         return model.layer4[-1]
     if arch in {"efficientnet_b0", "efficientnet-b0"}:
         return model.features[-1]

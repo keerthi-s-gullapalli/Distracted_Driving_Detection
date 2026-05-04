@@ -3,15 +3,22 @@ from torchvision import models
 from torchvision.models import (
     EfficientNet_B0_Weights,
     MobileNet_V2_Weights,
+    ResNet18_Weights,
     ResNet50_Weights,
 )
 
 
-ARCHES = ["resnet50", "efficientnet_b0", "mobilenet_v2"]
+ARCHES = ["resnet18", "resnet50", "efficientnet_b0", "mobilenet_v2"]
 
 
 def build_model(arch, num_classes=10, pretrained=True):
     arch = arch.lower()
+
+    if arch == "resnet18":
+        weights = ResNet18_Weights.DEFAULT if pretrained else None
+        model = models.resnet18(weights=weights)
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+        return model
 
     if arch == "resnet50":
         weights = ResNet50_Weights.DEFAULT if pretrained else None
@@ -52,7 +59,7 @@ def unfreeze_all(model):
 def classifier_parameters(model, arch):
     arch = arch.lower()
 
-    if arch == "resnet50":
+    if arch in {"resnet18", "resnet50"}:
         return model.fc.parameters()
 
     if arch in {"efficientnet_b0", "efficientnet-b0", "mobilenet_v2", "mobilenet-v2"}:
