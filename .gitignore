@@ -1,0 +1,29 @@
+# Python cache/build files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local machine settings
+.venv/
+venv/
+env/
+.env
+.DS_Store
+
+# Dataset files are too large for git
+data/
+
+# Model weights/checkpoints are too large for git
+*.pth
+*.pt
+*.ckpt
+
+# Keep report-friendly run outputs, but ignore heavy checkpoint files inside runs
+runs/**/*.pth
+runs/**/*.pt
+runs/**/*.ckpt
+
+# Generated split is reproducible from the CSV and seed
+split_seed42.json
