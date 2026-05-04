@@ -1,202 +1,308 @@
-import os
+import argparse
+import csv
+import json
 import random
-from collections import Counter
+import time
+from datetime import datetime
+from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms, models
-from torchvision.models import ResNet18_Weights
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
-# =====================
-# CONFIG
-# =====================
-DATA_DIR = os.environ.get(
-    "DATA_DIR",
-    r"C:\Users\keert\Downloads\DistractedDrivingDetection\data\train",
-)
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "32"))
-EPOCHS = int(os.environ.get("EPOCHS", "12"))
-LR_HEAD = float(os.environ.get("LR_HEAD", "1e-3"))
-LR_FULL = float(os.environ.get("LR_FULL", "1e-4"))
-VAL_FRAC = float(os.environ.get("VAL_FRAC", "0.2"))
-SEED = int(os.environ.get("SEED", "42"))
+import config
+from dataset import build_dataloaders
+from models import ARCHES, build_model, classifier_parameters, count_parameters
+from models import freeze_backbone, unfreeze_all
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("DEVICE:", DEVICE)
 
 # =====================
-# TRANSFORMS
+# REPRODUCIBILITY
 # =====================
-train_transform = transforms.Compose(
-    [
-        transforms.RandomResizedCrop(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ]
-)
+def set_seed(seed=config.SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-val_transform = transforms.Compose(
-    [
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ]
-)
 
-# =====================
-# DATASET (fixed: separate ImageFolders so val gets val transforms)
-# =====================
-train_root = datasets.ImageFolder(DATA_DIR, transform=train_transform)
-val_root = datasets.ImageFolder(DATA_DIR, transform=val_transform)
+def config_as_dict(args, split):
+    return {
+        "arch": args.arch,
+        "mode": args.mode,
+        "seed": config.SEED,
+        "batch_size": config.BATCH_SIZE,
+        "head_epochs": config.HEAD_EPOCHS,
+        "fine_tune_epochs": config.FINE_TUNE_EPOCHS,
+        "total_epochs": config.TOTAL_EPOCHS,
+        "lr_head": config.LR_HEAD,
+        "lr_full": config.LR_FULL,
+        "weight_decay": config.WEIGHT_DECAY,
+        "train_dir": str(config.TRAIN_DIR),
+        "driver_csv": str(config.DRIVER_CSV),
+        "split_json": str(config.SPLIT_JSON),
+        "split": split,
+    }
 
-assert len(train_root) == len(val_root)
-n = len(train_root)
-indices = list(range(n))
-random.seed(SEED)
-random.shuffle(indices)
-
-val_size = int(round(n * VAL_FRAC))
-train_size = n - val_size
-train_idx = indices[:train_size]
-val_idx = indices[train_size:]
-
-train_dataset = Subset(train_root, train_idx)
-val_dataset = Subset(val_root, val_idx)
-
-pin = torch.cuda.is_available()
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=0,
-    pin_memory=pin,
-)
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=0,
-    pin_memory=pin,
-)
 
 # =====================
-# CLASS WEIGHTS (computed on TRAIN split only)
+# TRAIN / VAL HELPERS
 # =====================
-train_targets = [train_root.samples[i][1] for i in train_idx]
-class_counts = Counter(train_targets)
+def run_one_epoch(model, loader, criterion, optimizer=None):
+    is_train = optimizer is not None
+    model.train(is_train)
 
-num_classes = len(train_root.classes)
-total_samples = len(train_targets)
-
-class_weights = torch.tensor(
-    [total_samples / max(1, class_counts[i]) for i in range(num_classes)],
-    dtype=torch.float32,
-    device=DEVICE,
-)
-
-# =====================
-# MODEL (fixed: weights API)
-# =====================
-model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
-model.fc = nn.Linear(model.fc.in_features, num_classes)
-model = model.to(DEVICE)
-
-# Freeze backbone initially
-for p in model.parameters():
-    p.requires_grad = False
-for p in model.fc.parameters():
-    p.requires_grad = True
-
-# =====================
-# LOSS + OPTIMIZER
-# =====================
-criterion = nn.CrossEntropyLoss(weight=class_weights)
-optimizer = optim.Adam(model.fc.parameters(), lr=LR_HEAD)
-
-# =====================
-# TRAIN / VAL
-# =====================
-def train_one_epoch(model, loader):
-    model.train()
     running_loss = 0.0
     correct = 0
     total = 0
+    pin = torch.cuda.is_available()
+    desc = "train" if is_train else "val"
 
-    pbar = tqdm(loader, desc="train", leave=False)
+    pbar = tqdm(loader, desc=desc, leave=False)
     for images, labels in pbar:
-        images = images.to(DEVICE, non_blocking=pin)
-        labels = labels.to(DEVICE, non_blocking=pin)
+        images = images.to(config.DEVICE, non_blocking=pin)
+        labels = labels.to(config.DEVICE, non_blocking=pin)
 
-        optimizer.zero_grad(set_to_none=True)
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        with torch.set_grad_enabled(is_train):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            if is_train:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
 
         running_loss += loss.item() * images.size(0)
         preds = outputs.argmax(dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
-
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     return running_loss / max(1, total), correct / max(1, total)
 
 
-@torch.no_grad()
-def validate(model, loader):
-    model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+def make_optimizer(model, args, phase):
+    if phase == "head":
+        params = classifier_parameters(model, args.arch)
+        lr = config.LR_HEAD
+    else:
+        params = model.parameters()
+        lr = config.LR_FULL
 
-    pbar = tqdm(loader, desc="val", leave=False)
-    for images, labels in pbar:
-        images = images.to(DEVICE, non_blocking=pin)
-        labels = labels.to(DEVICE, non_blocking=pin)
+    return optim.AdamW(params, lr=lr, weight_decay=config.WEIGHT_DECAY)
 
-        outputs = model(images)
-        loss = criterion(outputs, labels)
 
-        running_loss += loss.item() * images.size(0)
-        preds = outputs.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args, class_names):
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "epoch": epoch,
+        "best_val_acc": best_val_acc,
+        "arch": args.arch,
+        "mode": args.mode,
+        "class_names": class_names,
+        "num_classes": len(class_names),
+    }
+    torch.save(checkpoint, path)
 
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-    return running_loss / max(1, total), correct / max(1, total)
+def write_log_header(log_path):
+    with open(log_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "epoch",
+                "phase",
+                "train_loss",
+                "train_acc",
+                "val_loss",
+                "val_acc",
+                "epoch_seconds",
+                "lr",
+                "peak_gpu_memory_mb",
+            ]
+        )
+
+
+def append_log(log_path, row):
+    with open(log_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(row)
+
+
+def train_phase(model, train_loader, val_loader, criterion, args, run_dir, class_names,
+                start_epoch, num_epochs, phase, best_val_acc):
+    if phase == "head":
+        freeze_backbone(model, args.arch)
+    else:
+        unfreeze_all(model)
+
+    optimizer = make_optimizer(model, args, phase)
+    scheduler = CosineAnnealingLR(optimizer, T_max=max(1, num_epochs))
+    log_path = run_dir / "training_log.csv"
+
+    for local_epoch in range(num_epochs):
+        epoch = start_epoch + local_epoch
+        start_time = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+        train_loss, train_acc = run_one_epoch(model, train_loader, criterion, optimizer)
+        val_loss, val_acc = run_one_epoch(model, val_loader, criterion)
+
+        epoch_seconds = time.time() - start_time
+        lr = optimizer.param_groups[0]["lr"]
+        peak_memory_mb = 0.0
+        if torch.cuda.is_available():
+            peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+        print(f"Epoch [{epoch}/{config.TOTAL_EPOCHS}] ({phase})")
+        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"Val   Loss: {val_loss:.4f} | Val   Acc: {val_acc:.4f}")
+        print(f"Time: {epoch_seconds:.1f}s | LR: {lr:.6f} | Peak GPU MB: {peak_memory_mb:.1f}")
+
+        append_log(
+            log_path,
+            [
+                epoch,
+                phase,
+                f"{train_loss:.6f}",
+                f"{train_acc:.6f}",
+                f"{val_loss:.6f}",
+                f"{val_acc:.6f}",
+                f"{epoch_seconds:.2f}",
+                f"{lr:.8f}",
+                f"{peak_memory_mb:.2f}",
+            ],
+        )
+
+        scheduler.step()
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            save_checkpoint(
+                run_dir / "best_checkpoint.pth",
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                best_val_acc,
+                args,
+                class_names,
+            )
+            print("  saved best_checkpoint.pth")
+
+    return best_val_acc
 
 
 # =====================
-# TRAIN LOOP
+# MAIN
 # =====================
-best_val_acc = 0.0
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--arch", choices=ARCHES, default="resnet50")
+    parser.add_argument(
+        "--mode",
+        choices=["full", "head-only"],
+        default="full",
+        help="full = 3 head epochs then fine-tune, head-only = frozen backbone all epochs",
+    )
+    parser.add_argument("--run-name", default=None)
+    return parser.parse_args()
 
-for epoch in range(EPOCHS):
-    train_loss, train_acc = train_one_epoch(model, train_loader)
-    val_loss, val_acc = validate(model, val_loader)
 
-    print(f"Epoch [{epoch + 1}/{EPOCHS}]")
-    print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-    print(f"Val   Loss: {val_loss:.4f} | Val   Acc: {val_acc:.4f}")
+def main():
+    args = parse_args()
+    set_seed()
 
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        torch.save(model.state_dict(), "best_model.pth")
-        print("  saved best_model.pth")
+    print("DEVICE:", config.DEVICE)
+    print("Architecture:", args.arch)
+    print("Mode:", args.mode)
 
-    # Unfreeze after 3 epochs
-    if epoch == 2:
-        print("Unfreezing backbone...")
-        for p in model.parameters():
-            p.requires_grad = True
-        optimizer = optim.Adam(model.parameters(), lr=LR_FULL)
+    train_loader, val_loader, class_weights, class_names, split = build_dataloaders()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-print(f"Best Validation Accuracy: {best_val_acc:.4f}")
+    model = build_model(args.arch, num_classes=len(class_names)).to(config.DEVICE)
+    print(f"Parameters: {count_parameters(model):,}")
+
+    run_name = args.run_name
+    if run_name is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"{args.arch}_{args.mode}_{stamp}"
+
+    run_dir = Path(config.RUNS_DIR) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    write_log_header(run_dir / "training_log.csv")
+
+    with open(run_dir / "run_config.json", "w") as f:
+        json.dump(config_as_dict(args, split), f, indent=2)
+
+    best_val_acc = 0.0
+
+    if args.mode == "head-only":
+        best_val_acc = train_phase(
+            model,
+            train_loader,
+            val_loader,
+            criterion,
+            args,
+            run_dir,
+            class_names,
+            start_epoch=1,
+            num_epochs=config.TOTAL_EPOCHS,
+            phase="head",
+            best_val_acc=best_val_acc,
+        )
+    else:
+        best_val_acc = train_phase(
+            model,
+            train_loader,
+            val_loader,
+            criterion,
+            args,
+            run_dir,
+            class_names,
+            start_epoch=1,
+            num_epochs=config.HEAD_EPOCHS,
+            phase="head",
+            best_val_acc=best_val_acc,
+        )
+        best_val_acc = train_phase(
+            model,
+            train_loader,
+            val_loader,
+            criterion,
+            args,
+            run_dir,
+            class_names,
+            start_epoch=config.HEAD_EPOCHS + 1,
+            num_epochs=config.FINE_TUNE_EPOCHS,
+            phase="fine-tune",
+            best_val_acc=best_val_acc,
+        )
+
+    final_path = run_dir / "final_checkpoint.pth"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "arch": args.arch,
+            "mode": args.mode,
+            "class_names": class_names,
+            "best_val_acc": best_val_acc,
+        },
+        final_path,
+    )
+
+    print(f"Best Validation Accuracy: {best_val_acc:.4f}")
+    print(f"Run folder: {run_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
