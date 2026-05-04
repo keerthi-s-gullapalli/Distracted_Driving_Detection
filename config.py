@@ -23,7 +23,7 @@ RUNS_DIR = Path(os.environ.get("RUNS_DIR", PROJECT_ROOT / "runs"))
 # TRAINING SETTINGS
 # =====================
 SEED = int(os.environ.get("SEED", "42"))
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "32"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "64"))
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "0"))
 
 HEAD_EPOCHS = int(os.environ.get("HEAD_EPOCHS", "3"))
@@ -67,3 +67,5 @@ CLASS_TO_RISK = {
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+if DEVICE.type == "cuda":
+    torch.backends.cudnn.benchmark = True
