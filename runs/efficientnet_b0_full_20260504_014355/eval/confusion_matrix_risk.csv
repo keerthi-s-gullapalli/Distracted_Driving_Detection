@@ -1,0 +1,5 @@
+actual/predicted,Low,Medium,High,Critical
+Low,345,232,2,7
+Medium,63,782,48,135
+High,17,9,1839,105
+Critical,13,3,22,1457
