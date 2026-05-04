@@ -17,6 +17,7 @@ import config
 from dataset import build_dataloaders
 from models import ARCHES, build_model, classifier_parameters, count_parameters
 from models import freeze_backbone, unfreeze_all
+from plots import plot_training_curves
 
 
 # =====================
@@ -300,6 +301,7 @@ def main():
     )
 
     print(f"Best Validation Accuracy: {best_val_acc:.4f}")
+    plot_training_curves(run_dir / "training_log.csv", run_dir / "figures")
     print(f"Run folder: {run_dir}")
 
 

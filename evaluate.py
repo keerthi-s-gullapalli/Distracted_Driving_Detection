@@ -11,6 +11,8 @@ from tqdm import tqdm
 import config
 from dataset import build_dataloaders
 from models import build_model, count_parameters
+from plots import plot_confusion_matrix, plot_per_class_metrics
+from plots import plot_precision_recall_curves, risk_probabilities
 
 
 # =====================
@@ -66,17 +68,20 @@ def evaluate_model(model, loader):
     model.eval()
     y_true = []
     y_pred = []
+    y_prob = []
     pin = torch.cuda.is_available()
 
     with torch.no_grad():
         for images, labels in tqdm(loader, desc="evaluate"):
             images = images.to(config.DEVICE, non_blocking=pin)
             outputs = model(images)
-            preds = outputs.argmax(dim=1).cpu().tolist()
+            probs = torch.softmax(outputs, dim=1)
+            preds = probs.argmax(dim=1).cpu().tolist()
             y_pred.extend(preds)
+            y_prob.extend(probs.cpu().numpy())
             y_true.extend(labels.tolist())
 
-    return np.array(y_true), np.array(y_pred)
+    return np.array(y_true), np.array(y_pred), np.array(y_prob)
 
 
 def measure_latency(model, loader, warmup=10, repeats=100):
@@ -98,6 +103,13 @@ def measure_latency(model, loader, warmup=10, repeats=100):
             torch.cuda.synchronize()
 
     return (time.perf_counter() - start) * 1000.0 / repeats
+
+
+def mean_or_none(values):
+    values = [value for value in values if not np.isnan(value)]
+    if not values:
+        return None
+    return float(np.mean(values))
 
 
 # =====================
@@ -122,7 +134,7 @@ def main():
     model = build_model(arch, num_classes=len(class_names), pretrained=False).to(config.DEVICE)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    y_true, y_pred = evaluate_model(model, val_loader)
+    y_true, y_pred, y_prob = evaluate_model(model, val_loader)
     cm = confusion_matrix(y_true, y_pred, len(class_names))
     class_rows, macro_f1 = precision_recall_f1(cm)
     accuracy = float((y_true == y_pred).mean())
@@ -130,6 +142,7 @@ def main():
     risk_lookup = np.array(class_to_risk_ids(class_names))
     risk_true = risk_lookup[y_true]
     risk_pred = risk_lookup[y_pred]
+    risk_prob = risk_probabilities(y_prob, class_names)
     risk_cm = confusion_matrix(risk_true, risk_pred, len(config.RISK_TIER_NAMES))
     _, risk_macro_f1 = precision_recall_f1(risk_cm)
     risk_accuracy = float((risk_true == risk_pred).mean())
@@ -154,13 +167,46 @@ def main():
         class_name: row
         for class_name, row in zip(class_names, class_rows)
     }
+
+    plot_confusion_matrix(
+        cm,
+        class_names,
+        "10-Class Confusion Matrix",
+        output_dir / "confusion_matrix_10class.png",
+    )
+    plot_confusion_matrix(
+        risk_cm,
+        config.RISK_TIER_NAMES,
+        "Risk Tier Confusion Matrix",
+        output_dir / "confusion_matrix_risk.png",
+    )
+    plot_per_class_metrics(per_class, output_dir / "per_class_metrics.png")
+    ap_scores = plot_precision_recall_curves(
+        y_true,
+        y_prob,
+        class_names,
+        output_dir / "precision_recall_10class.png",
+        "One-vs-Rest Precision-Recall Curves",
+    )
+    risk_ap_scores = plot_precision_recall_curves(
+        risk_true,
+        risk_prob,
+        config.RISK_TIER_NAMES,
+        output_dir / "precision_recall_risk.png",
+        "Risk Tier Precision-Recall Curves",
+    )
+
     metrics = {
         "arch": arch,
         "mode": checkpoint.get("mode"),
         "accuracy": accuracy,
         "macro_f1": macro_f1,
+        "average_precision_by_class": ap_scores,
+        "macro_average_precision": mean_or_none(list(ap_scores.values())),
         "risk_accuracy": risk_accuracy,
         "risk_macro_f1": risk_macro_f1,
+        "average_precision_by_risk_tier": risk_ap_scores,
+        "risk_macro_average_precision": mean_or_none(list(risk_ap_scores.values())),
         "critical_to_low_or_medium_count": int(critical_to_low_medium.sum()),
         "critical_count": int(critical_mask.sum()),
         "latency_ms_per_image_batch1": latency_ms,
